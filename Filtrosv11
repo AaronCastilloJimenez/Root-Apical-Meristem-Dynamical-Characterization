@@ -1,0 +1,712 @@
+#!/usr/bin/env python3
+"""
+Pipeline Completo v3: Filtrado 3D GPU + Evaluación Estadística Rigurosa
+Hardware: RTX 4080 Super | Objetivo: Paredes celulares para PlantSeg
+"""
+
+import numpy as np
+import tifffile
+import os
+import glob
+import sys
+import json
+import time
+import warnings
+from pathlib import Path
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Tuple, Optional
+from collections import defaultdict
+
+warnings.filterwarnings('ignore')
+
+# Estadísticas
+from scipy import stats
+from scipy.stats import shapiro, f_oneway, kruskal, ttest_ind, mannwhitneyu
+import pandas as pd
+
+# ==============================================================================
+# CONFIGURACIÓN GPU
+# ==============================================================================
+try:
+    import cupy as cp
+    from cupyx.scipy.ndimage import median_filter as cp_median_filter
+    from cupyx.scipy.ndimage import gaussian_filter as cp_gaussian_filter
+    from cupyx.scipy.ndimage import sobel as cp_sobel
+    GPU_AVAILABLE = True
+    print(f"✅ GPU: {cp.cuda.runtime.getDeviceProperties(0)['name'].decode()}")
+    print(f"   Memoria: {cp.cuda.Device(0).mem_info[0]/1e9:.2f} GB")
+except ImportError:
+    print("⚠️  GPU no disponible. Usando CPU.")
+    from scipy.ndimage import median_filter, gaussian_filter, sobel
+    GPU_AVAILABLE = False
+    cp = np
+
+# ==============================================================================
+# CONFIGURACIÓN GLOBAL
+# ==============================================================================
+
+@dataclass
+class Config:
+    input_dir: str = "~/Escritorio/imagenes_tiff_raw"
+    output_dir: str = "~/Escritorio/pipeline_output"
+    
+    # Resolución microscopio
+    resolution_xy: float = 0.3093  # µm/pixel
+    resolution_z: float = 1.0      # µm/pixel
+    
+    # Parámetros filtros
+    bg_radius_um: float = 10.0
+    sigma_denoise_um: float = 0.3
+    dog_sigma_small_um: float = 0.5
+    dog_sigma_large_um: float = 1.5
+    clahe_clip: float = 0.01
+    tophat_radius_um: float = 3.0
+    
+    # Parámetros estadísticos
+    alpha_significance: float = 0.05  # Nivel de significancia
+    n_bootstrap: int = 1000           # Iteraciones bootstrap
+    
+    def __post_init__(self):
+        self.input_dir = os.path.expanduser(self.input_dir)
+        self.output_dir = os.path.expanduser(self.output_dir)
+        self.anisotropy = self.resolution_z / self.resolution_xy
+        self.bg_radius_px = int(self.bg_radius_um / self.resolution_xy)
+        self.bg_radius_z = max(1, int(self.bg_radius_px / self.anisotropy))
+        
+        for subdir in ['filtered', 'evaluation', 'plantseg_input', 'statistics']:
+            os.makedirs(f"{self.output_dir}/{subdir}", exist_ok=True)
+
+CONFIG = Config()
+
+# ==============================================================================
+# UTILIDADES GPU
+# ==============================================================================
+
+def to_gpu(arr): 
+    return cp.asarray(arr) if GPU_AVAILABLE else arr
+
+def to_cpu(arr):
+    if GPU_AVAILABLE and isinstance(arr, cp.ndarray):
+        return cp.asnumpy(arr)
+    return arr if isinstance(arr, np.ndarray) else np.array(arr)
+
+def gpu_percentile(arr, q):
+    if GPU_AVAILABLE:
+        return float(cp.percentile(arr, q))
+    return float(np.percentile(arr, q))
+
+# ==============================================================================
+# PIPELINE DE FILTRADO (6 VARIANTES)
+# ==============================================================================
+
+class FilterPipeline:
+    def __init__(self, config: Config = CONFIG):
+        self.config = config
+        self.times = {}
+        
+    def _time_stage(self, name, func, *args, **kwargs):
+        start = time.time()
+        result = func(*args, **kwargs)
+        self.times[name] = time.time() - start
+        return result
+    
+    def normalize(self, img, p_low=0.5, p_high=99.5):
+        img_gpu = to_gpu(img.astype(np.float32))
+        v_low = gpu_percentile(img_gpu, p_low)
+        v_high = gpu_percentile(img_gpu, p_high)
+        if v_high == v_low:
+            return to_cpu(np.zeros_like(img_gpu))
+        img_norm = (img_gpu - v_low) / (v_high - v_low)
+        img_norm = cp.clip(img_norm, 0, 1) if GPU_AVAILABLE else np.clip(img_norm, 0, 1)
+        return to_cpu(img_norm)
+    
+    def subtract_background_3d(self, img):
+        img_gpu = to_gpu(img)
+        footprint = (self.config.bg_radius_z, self.config.bg_radius_px, self.config.bg_radius_px)
+        if GPU_AVAILABLE:
+            bg = cp_median_filter(img_gpu, size=footprint)
+            result = cp.maximum(img_gpu - bg, 0)
+        else:
+            bg = median_filter(img_gpu, size=footprint)
+            result = np.maximum(img_gpu - bg, 0)
+        return to_cpu(result)
+    
+    def denoise_gaussian_3d(self, img):
+        sigma_xy = self.config.sigma_denoise_um / self.config.resolution_xy
+        sigma_z = self.config.sigma_denoise_um / self.config.resolution_z
+        img_gpu = to_gpu(img)
+        sigmas = (sigma_z, sigma_xy, sigma_xy)
+        if GPU_AVAILABLE:
+            result = cp_gaussian_filter(img_gpu, sigma=sigmas)
+        else:
+            result = gaussian_filter(img_gpu, sigma=sigmas)
+        return to_cpu(result)
+    
+    def dog_3d(self, img):
+        img_gpu = to_gpu(img)
+        s_small_xy = self.config.dog_sigma_small_um / self.config.resolution_xy
+        s_small_z = self.config.dog_sigma_small_um / self.config.resolution_z
+        s_large_xy = self.config.dog_sigma_large_um / self.config.resolution_xy
+        s_large_z = self.config.dog_sigma_large_um / self.config.resolution_z
+        
+        if GPU_AVAILABLE:
+            g1 = cp_gaussian_filter(img_gpu, sigma=(s_small_z, s_small_xy, s_small_xy))
+            g2 = cp_gaussian_filter(img_gpu, sigma=(s_large_z, s_large_xy, s_large_xy))
+            dog = g1 - g2
+        else:
+            g1 = gaussian_filter(img_gpu, sigma=(s_small_z, s_small_xy, s_small_xy))
+            g2 = gaussian_filter(img_gpu, sigma=(s_large_z, s_large_xy, s_large_xy))
+            dog = g1 - g2
+        
+        dog_min, dog_max = dog.min(), dog.max()
+        return to_cpu((dog - dog_min) / (dog_max - dog_min + 1e-8))
+    
+    def clahe_3d(self, img):
+        from skimage import exposure
+        img_cpu = to_cpu(img)
+        result = np.zeros_like(img_cpu, dtype=np.float32)
+        for z in range(img_cpu.shape[0]):
+            plane = img_cpu[z]
+            plane_norm = (plane - plane.min()) / (plane.max() - plane.min() + 1e-8)
+            result[z] = exposure.equalize_adapthist(plane_norm, clip_limit=self.config.clahe_clip, kernel_size=51)
+        return result
+    
+    def tophat_3d(self, img):
+        from scipy.ndimage import grey_opening
+        img_cpu = to_cpu(img)
+        radius_px = int(self.config.tophat_radius_um / self.config.resolution_xy)
+        radius_z = max(1, int(radius_px / self.config.anisotropy))
+        footprint = np.ones((radius_z, radius_px, radius_px), dtype=bool)
+        opened = grey_opening(img_cpu, footprint=footprint)
+        return img_cpu - opened
+    
+    def run_variant(self, img, variant_name):
+        """Ejecuta una variante específica de filtrado"""
+        print(f"\n🔬 Variante: {variant_name}")
+        self.times = {}
+        
+        if variant_name == "01_RAW":
+            return self.normalize(img), self.times
+        
+        elif variant_name == "02_BG_SUB":
+            norm = self.normalize(img)
+            result = self._time_stage('bg_sub', self.subtract_background_3d, norm)
+            return result, self.times
+        
+        elif variant_name == "03_CLAHE":
+            norm = self.normalize(img)
+            result = self._time_stage('clahe', self.clahe_3d, norm)
+            return result, self.times
+        
+        elif variant_name == "04_DOG3D":
+            norm = self.normalize(img)
+            bg = self.subtract_background_3d(norm)
+            denoised = self.denoise_gaussian_3d(bg)
+            result = self._time_stage('dog3d', self.dog_3d, denoised)
+            return result, self.times
+        
+        elif variant_name == "05_TOPHAT":
+            norm = self.normalize(img)
+            bg = self.subtract_background_3d(norm)
+            denoised = self.denoise_gaussian_3d(bg)
+            result = self._time_stage('tophat', self.tophat_3d, denoised)
+            return result, self.times
+        
+        elif variant_name == "06_COMBINED":
+            norm = self.normalize(img)
+            bg = self.subtract_background_3d(norm)
+            denoised = self.denoise_gaussian_3d(bg)
+            dog = self.dog_3d(denoised)
+            result = self._time_stage('clahe_final', self.clahe_3d, dog)
+            return result, self.times
+        
+        else:
+            raise ValueError(f"Variante desconocida: {variant_name}")
+
+# ==============================================================================
+# EVALUACIÓN ESTADÍSTICA
+# ==============================================================================
+
+class StatisticalEvaluator:
+    """Evaluación con análisis estadístico riguroso"""
+    
+    def __init__(self, config: Config = CONFIG):
+        self.config = config
+        self.results = defaultdict(list)
+        self.metrics_history = []
+        
+    def compute_metrics(self, img, method_name):
+        """Calcula métricas de calidad de imagen (Corregido para 3D)"""
+        from skimage import measure, feature
+        from scipy.ndimage import uniform_filter, gaussian_laplace
+        
+        img_norm = (img - img.min()) / (img.max() - img.min() + 1e-8)
+        
+        # 1. SNR
+        bg = np.percentile(img_norm, 10)
+        fg = np.percentile(img_norm, 90)
+        mask_fg = img_norm > (bg + 0.1 * (fg - bg))
+        snr = np.mean(img_norm[mask_fg]) / (np.std(img_norm[~mask_fg]) + 1e-8)
+        
+        # 2. Contraste local
+        local_max = uniform_filter(img_norm, size=50, mode='reflect')
+        local_min = -uniform_filter(-img_norm, size=50, mode='reflect')
+        contrast = np.mean((local_max - local_min) / (local_max + local_min + 1e-8))
+        
+        # 3. Entropía
+        hist, _ = np.histogram(img_norm.flatten(), bins=256, density=True)
+        hist = hist[hist > 0]
+        entropy = -np.sum(hist * np.log2(hist + 1e-10))
+        
+        # 4 & 6. Índice de estructura y Sharpness (Laplaciano funciona nativo en 3D)
+        laplacian = gaussian_laplace(img_norm, sigma=1.0)
+        structure_idx = np.std(laplacian)
+        sharpness = np.var(np.abs(laplacian))
+        
+        # 5. Continuidad de bordes (Iterando en 2D para Canny)
+        total_length = 0.0
+        total_props = 0
+        
+        for z in range(img_norm.shape[0]):
+            slice_img = img_norm[z]
+            if slice_img.max() < 0.05:
+                continue
+                
+            edges = feature.canny(slice_img, sigma=1.0, low_threshold=0.1, high_threshold=0.3)
+            labeled = measure.label(edges)
+            props = measure.regionprops(labeled)
+            
+            if len(props) > 0:
+                total_length += sum(p.perimeter for p in props)
+                total_props += len(props)
+                
+        if total_props > 0:
+            mean_length = total_length / total_props
+            continuity = mean_length / (total_props + 1)
+        else:
+            mean_length = continuity = total_length = 0
+
+        metrics = {
+            'method': method_name,
+            'snr': float(snr),
+            'contrast': float(contrast),
+            'entropy': float(entropy),
+            'structure_index': float(structure_idx),
+            'continuity': float(continuity),
+            'edge_length': float(total_length),
+            'mean_fragment_length': float(mean_length),
+            'sharpness': float(sharpness),
+            'n_fragments': int(total_props)
+        }
+        
+        self.metrics_history.append(metrics)
+        return metrics
+    
+    def bootstrap_confidence_interval(self, data, confidence=0.95):
+        """Calcula intervalo de confianza por bootstrap"""
+        n = len(data)
+        bootstrap_means = []
+        for _ in range(self.config.n_bootstrap):
+            sample = np.random.choice(data, size=n, replace=True)
+            bootstrap_means.append(np.mean(sample))
+        
+        alpha = 1 - confidence
+        lower = np.percentile(bootstrap_means, alpha/2 * 100)
+        upper = np.percentile(bootstrap_means, (1 - alpha/2) * 100)
+        return lower, upper, np.std(bootstrap_means)
+    
+    def normality_test(self, data):
+        """Test de normalidad de Shapiro-Wilk"""
+        if len(data) < 3:
+            return False, 0.0
+        stat, p_value = shapiro(data)
+        return p_value > self.config.alpha_significance, p_value
+    
+    def compare_methods_statistical(self, results_by_method: Dict[str, List[Dict]]) -> Dict:
+        """
+        Comparación estadística rigurosa entre métodos.
+        """
+        print("\n" + "="*80)
+        print("ANÁLISIS ESTADÍSTICO DE COMPARACIÓN DE MÉTODOS")
+        print("="*80)
+        
+        comparison_results = {}
+        
+        # Extraer métricas por método
+        metrics_by_name = defaultdict(lambda: defaultdict(list))
+        for method, results in results_by_method.items():
+            for r in results:
+                for key, val in r.items():
+                    if key != 'method' and isinstance(val, (int, float)):
+                        metrics_by_name[method][key].append(val)
+        
+        # Análisis por métrica
+        all_metrics = ['snr', 'contrast', 'continuity', 'sharpness', 'structure_index']
+        
+        for metric in all_metrics:
+            print(f"\n📊 Métrica: {metric.upper()}")
+            print("-" * 60)
+            
+            data_by_method = {m: metrics_by_name[m][metric] for m in results_by_method.keys()}
+            
+            # Estadísticas descriptivas
+            stats_desc = {}
+            for method, data in data_by_method.items():
+                if len(data) == 0:
+                    continue
+                    
+                mean = np.mean(data)
+                std = np.std(data)
+                median = np.median(data)
+                ci_low, ci_high, se = self.bootstrap_confidence_interval(data)
+                
+                # Test de normalidad
+                is_normal, p_norm = self.normality_test(data)
+                
+                stats_desc[method] = {
+                    'n': len(data),
+                    'mean': mean,
+                    'std': std,
+                    'median': median,
+                    'ci_95': (ci_low, ci_high),
+                    'std_error': se,
+                    'normal': is_normal,
+                    'p_normal': p_norm
+                }
+                
+                print(f"  {method:15s}: μ={mean:.4f}, σ={std:.4f}, "
+                      f"med={median:.4f}, 95%CI=[{ci_low:.4f}, {ci_high:.4f}] "
+                      f"(normal: {'Sí' if is_normal else 'No'}, p={p_norm:.3f})")
+            
+            # Tests de comparación (si hay múltiples archivos)
+            if len(data_by_method) >= 2 and all(len(v) >= 2 for v in data_by_method.values()):
+                all_data = [v for v in data_by_method.values() if len(v) > 0]
+                
+                # ANOVA o Kruskal-Wallis según normalidad
+                all_normal = all(stats_desc[m]['normal'] for m in stats_desc if m in data_by_method)
+                
+                if all_normal and len(all_data) >= 2:
+                    stat, p_val = f_oneway(*all_data)
+                    test_name = "ANOVA"
+                else:
+                    stat, p_val = kruskal(*all_data)
+                    test_name = "Kruskal-Wallis"
+                
+                print(f"\n  Test {test_name}: F/H={stat:.4f}, p={p_val:.4f}")
+                
+                if p_val < self.config.alpha_significance:
+                    print(f"  ✅ Diferencias significativas entre métodos (p < {self.config.alpha_significance})")
+                    
+                    # Post-hoc: comparaciones pareadas
+                    print(f"\n  Comparaciones pareadas (corrección Bonferroni):")
+                    methods = list(data_by_method.keys())
+                    n_comparisons = len(methods) * (len(methods) - 1) // 2
+                    alpha_corrected = self.config.alpha_significance / n_comparisons
+                    
+                    for i, m1 in enumerate(methods):
+                        for m2 in methods[i+1:]:
+                            d1, d2 = data_by_method[m1], data_by_method[m2]
+                            
+                            if stats_desc.get(m1, {}).get('normal', False) and \
+                               stats_desc.get(m2, {}).get('normal', False):
+                                stat_t, p_t = ttest_ind(d1, d2)
+                                test = "t-test"
+                            else:
+                                stat_t, p_t = mannwhitneyu(d1, d2, alternative='two-sided')
+                                test = "Mann-Whitney U"
+                            
+                            sig = "✅" if p_t < alpha_corrected else "❌"
+                            print(f"    {m1} vs {m2}: {test} p={p_t:.4f} {sig}")
+                else:
+                    print(f"  ❌ No hay diferencias significativas (p >= {self.config.alpha_significance})")
+            
+            comparison_results[metric] = {
+                'descriptive': stats_desc,
+                'test': test_name if 'test_name' in dir() else None,
+                'p_value': p_val if 'p_val' in dir() else None
+            }
+        
+        return comparison_results
+    
+    def effect_size_analysis(self, results_by_method: Dict) -> Dict:
+        """Calcula tamaños de efecto (Cohen's d)"""
+        print("\n" + "="*80)
+        print("ANÁLISIS DE TAMAÑO DE EFECTO (Cohen's d)")
+        print("="*80)
+        print("Interpretación: |d| < 0.2 (negligible), 0.2-0.5 (pequeño), "
+              "0.5-0.8 (mediano), > 0.8 (grande)")
+        
+        effect_sizes = {}
+        methods = list(results_by_method.keys())
+        metrics = ['snr', 'contrast', 'continuity', 'sharpness']
+        
+        for metric in metrics:
+            print(f"\n{metric.upper()}:")
+            for i, m1 in enumerate(methods):
+                for m2 in methods[i+1:]:
+                    data1 = [r[metric] for r in results_by_method[m1]]
+                    data2 = [r[metric] for r in results_by_method[m2]]
+                    
+                    if len(data1) > 0 and len(data2) > 0:
+                        mean1, mean2 = np.mean(data1), np.mean(data2)
+                        std1, std2 = np.std(data1), np.std(data2)
+                        
+                        # Cohen's d pooled
+                        n1, n2 = len(data1), len(data2)
+                        pooled_std = np.sqrt(((n1-1)*std1**2 + (n2-1)*std2**2) / (n1+n2-2))
+                        cohens_d = (mean1 - mean2) / pooled_std if pooled_std > 0 else 0
+                        
+                        magnitude = "negligible" if abs(cohens_d) < 0.2 else \
+                                   "small" if abs(cohens_d) < 0.5 else \
+                                   "medium" if abs(cohens_d) < 0.8 else "large"
+                        
+                        print(f"  {m1} vs {m2}: d = {cohens_d:+.3f} ({magnitude})")
+                        effect_sizes[f"{m1}_vs_{m2}_{metric}"] = cohens_d
+        
+        return effect_sizes
+    
+    def rank_methods(self, results_by_method: Dict, weights: Optional[Dict] = None) -> pd.DataFrame:
+        """Ranking ponderado de métodos con intervalos de confianza"""
+        if weights is None:
+            weights = {
+                'snr': 0.25,
+                'contrast': 0.20,
+                'continuity': 0.30,
+                'sharpness': 0.15,
+                'structure_index': 0.10
+            }
+        
+        print("\n" + "="*80)
+        print("RANKING DE MÉTODOS (Score Ponderado)")
+        print("="*80)
+        
+        rankings = []
+        for method, results in results_by_method.items():
+            if len(results) == 0:
+                continue
+            
+            scores = []
+            for r in results:
+                score = sum(r.get(k, 0) * w for k, w in weights.items())
+                scores.append(score)
+            
+            mean_score = np.mean(scores)
+            ci_low, ci_high, se = self.bootstrap_confidence_interval(scores)
+            
+            rankings.append({
+                'method': method,
+                'mean_score': mean_score,
+                'ci_lower': ci_low,
+                'ci_upper': ci_high,
+                'std_error': se,
+                'n': len(scores)
+            })
+        
+        df_rank = pd.DataFrame(rankings).sort_values('mean_score', ascending=False)
+        df_rank['rank'] = range(1, len(df_rank) + 1)
+        
+        print(f"\n{'Rank':<6} {'Método':<15} {'Score':<10} {'95% CI':<25} {'SE':<8}")
+        print("-" * 80)
+        for _, row in df_rank.iterrows():
+            ci_str = f"[{row['ci_lower']:.3f}, {row['ci_upper']:.3f}]"
+            print(f"{row['rank']:<6} {row['method']:<15} {row['mean_score']:.3f}     "
+                  f"{ci_str:<25} {row['std_error']:.3f}")
+        
+        return df_rank
+    
+    def generate_full_report(self, results_by_method: Dict, output_dir: str):
+        """Genera reporte estadístico completo"""
+        # 1. Comparación estadística
+        comparison = self.compare_methods_statistical(results_by_method)
+        
+        # 2. Tamaños de efecto
+        effects = self.effect_size_analysis(results_by_method)
+        
+        # 3. Ranking
+        ranking = self.rank_methods(results_by_method)
+        
+        # Guardar resultados
+        report = {
+            'comparison': comparison,
+            'effect_sizes': effects,
+            'ranking': ranking.to_dict('records'),
+            'raw_metrics': self.metrics_history
+        }
+        
+        with open(f"{output_dir}/statistics/full_statistical_report.json", 'w') as f:
+            json.dump(report, f, indent=2, default=str)
+        
+        ranking.to_csv(f"{output_dir}/statistics/ranking.csv", index=False)
+        
+        # Visualización
+        self._plot_statistical_comparison(results_by_method, output_dir)
+        
+        return report
+    
+    def _plot_statistical_comparison(self, results_by_method, output_dir):
+        """Genera gráficos estadísticos"""
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            axes = axes.flatten()
+            
+            metrics = ['snr', 'contrast', 'continuity', 'sharpness', 'structure_index']
+            
+            for i, metric in enumerate(metrics):
+                ax = axes[i]
+                
+                data_for_plot = []
+                labels = []
+                for method, results in results_by_method.items():
+                    values = [r[metric] for r in results]
+                    data_for_plot.extend(values)
+                    labels.extend([method] * len(values))
+                
+                df_plot = pd.DataFrame({metric: data_for_plot, 'method': labels})
+                
+                sns.boxplot(data=df_plot, x='method', y=metric, ax=ax)
+                ax.set_title(f'{metric.upper()}')
+                ax.tick_params(axis='x', rotation=45)
+            
+            # Gráfico de ranking
+            ax = axes[5]
+            ranking_data = []
+            for method, results in results_by_method.items():
+                scores = [sum(r.get(k, 0) * w for k, w in {
+                    'snr': 0.25, 'contrast': 0.20, 'continuity': 0.30,
+                    'sharpness': 0.15, 'structure_index': 0.10
+                }.items()) for r in results]
+                ranking_data.extend([(method, s) for s in scores])
+            
+            df_rank = pd.DataFrame(ranking_data, columns=['method', 'score'])
+            sns.boxplot(data=df_rank, x='method', y='score', ax=ax)
+            ax.set_title('Score Ponderado Total')
+            ax.tick_params(axis='x', rotation=45)
+            
+            plt.tight_layout()
+            plt.savefig(f"{output_dir}/statistics/statistical_comparison.png", dpi=300, bbox_inches='tight')
+            print(f"\n📊 Gráficos guardados en: {output_dir}/statistics/")
+            plt.close()
+            
+        except ImportError:
+            print("⚠️  matplotlib/seaborn no instalados. Omitiendo gráficos.")
+
+# ==============================================================================
+# EXPORTACIÓN PARA PLANTSEG
+# ==============================================================================
+
+class PlantSegExporter:
+    def __init__(self, config: Config = CONFIG):
+        self.config = config
+    
+    def export(self, img, filename, output_dir):
+        import h5py
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # TIFF
+        tiff_path = f"{output_dir}/{filename}.tif"
+        img_uint16 = (img * 65535).astype(np.uint16) if img.max() <= 1.0 else img.astype(np.uint16)
+        tifffile.imwrite(tiff_path, img_uint16, imagej=True,
+                        resolution=(1.0/self.config.resolution_xy, 1.0/self.config.resolution_xy),
+                        metadata={'spacing': self.config.resolution_z, 'unit': 'um', 'axes': 'ZYX'})
+        
+        # HDF5
+        hdf5_path = f"{output_dir}/{filename}.h5"
+        with h5py.File(hdf5_path, 'w') as f:
+            ds = f.create_dataset('raw', data=img.astype(np.float32), compression='gzip', chunks=True)
+            ds.attrs['element_size_um'] = [self.config.resolution_z, self.config.resolution_xy, self.config.resolution_xy]
+            ds.attrs['axis_order'] = 'zyx'
+        
+        return {'tiff': tiff_path, 'hdf5': hdf5_path}
+
+# ==============================================================================
+# PIPELINE PRINCIPAL
+# ==============================================================================
+
+class CompletePipeline:
+    VARIANTS = ["01_RAW", "02_BG_SUB", "03_CLAHE", "04_DOG3D", "05_TOPHAT", "06_COMBINED"]
+    
+    def __init__(self):
+        self.filter = FilterPipeline()
+        self.evaluator = StatisticalEvaluator()
+        self.exporter = PlantSegExporter()
+        self.all_results = {v: [] for v in self.VARIANTS}
+    
+    def process_file(self, filepath):
+        filename = Path(filepath).stem
+        print(f"\n{'='*80}")
+        print(f"PROCESANDO: {filename}")
+        print(f"{'='*80}")
+        
+        raw_img = tifffile.imread(filepath)
+        print(f"Formato: {raw_img.shape} ZYX | {raw_img.dtype}")
+        
+        variant_images = {}
+        
+        for variant in self.VARIANTS:
+            filtered, times = self.filter.run_variant(raw_img, variant)
+            variant_images[variant] = filtered
+            
+            # Evaluar
+            metrics = self.evaluator.compute_metrics(filtered, variant)
+            self.all_results[variant].append(metrics)
+            
+            # Guardar debug
+            debug_path = f"{CONFIG.output_dir}/filtered/{filename}_{variant}.tif"
+            tifffile.imwrite(debug_path, (filtered * 65535).astype(np.uint16))
+        
+        # Seleccionar mejor por score ponderado
+        scores = {}
+        for v in self.VARIANTS:
+            m = self.all_results[v][-1]
+            scores[v] = (m['snr']*0.25 + m['contrast']*0.20 + m['continuity']*0.30 + 
+                        m['sharpness']*0.15 + m['structure_index']*0.10)
+        
+        best = max(scores, key=scores.get)
+        print(f"\n🏆 Mejor método: {best} (score: {scores[best]:.3f})")
+        
+        # Exportar mejor
+        exports = self.exporter.export(variant_images[best], f"{filename}_BEST_{best}", 
+                                      f"{CONFIG.output_dir}/plantseg_input")
+        
+        return {'filename': filename, 'best': best, 'exports': exports}
+    
+    def run_batch(self, pattern="*C00*.tif"):
+        files = glob.glob(f"{CONFIG.input_dir}/{pattern}")
+        print(f"\n🔍 {len(files)} archivos encontrados")
+        
+        for i, f in enumerate(files, 1):
+            print(f"\n[{i}/{len(files)}] {os.path.basename(f)}")
+            try:
+                self.process_file(f)
+            except Exception as e:
+                print(f"❌ Error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Análisis estadístico final
+        if len(files) > 0:
+            print("\n" + "="*80)
+            print("GENERANDO ANÁLISIS ESTADÍSTICO FINAL")
+            print("="*80)
+            self.evaluator.generate_full_report(self.all_results, CONFIG.output_dir)
+        
+        print(f"\n✅ Completado. Resultados en: {CONFIG.output_dir}/")
+
+# ==============================================================================
+# EJECUCIÓN
+# ==============================================================================
+
+if __name__ == "__main__":
+    print("="*80)
+    print("PIPELINE DE FILTRADO 3D + ANÁLISIS ESTADÍSTICO")
+    print(f"GPU: {'Disponible' if GPU_AVAILABLE else 'No disponible'}")
+    print(f"Input: {CONFIG.input_dir}")
+    print(f"Output: {CONFIG.output_dir}")
+    print("="*80)
+    
+    pipeline = CompletePipeline()
+    pipeline.run_batch()
